@@ -6,5 +6,6 @@ This repo contains a face detection app built using Flask and OpenCV/InsightFace
 
 ```bash
 dir facedetection
+#move face_detect_cv.py to facedetection
 cd facedetection
-python app.py
+python face_detect_cv.py

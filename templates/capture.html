@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Face Verification</title>
+</head>
+<body>
+    <h1>📸 Capture Face(s)</h1>
+    <video id="video" width="640" height="480" autoplay></video>
+    <br>
+    <button id="snap">Capture</button>
+    <canvas id="canvas" width="640" height="480" style="display:none;"></canvas>
+    <p id="result"></p>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const context = canvas.getContext('2d');
+        const snap = document.getElementById('snap');
+        const result = document.getElementById('result');
+
+        // Access webcam
+        navigator.mediaDevices.getUserMedia({ video: true })
+            .then(stream => video.srcObject = stream)
+            .catch(err => console.error("Camera access denied:", err));
+
+        snap.onclick = function() {
+            context.drawImage(video, 0, 0, 640, 480);
+            const dataURL = canvas.toDataURL('image/jpeg');
+
+            fetch('/verify', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                body: 'image=' + encodeURIComponent(dataURL)
+            })
+            .then(res => res.text())
+            .then(text => result.innerHTML = text)
+            .catch(err => result.innerText = 'Error: ' + err);
+        };
+    </script>
+</body>
+</html>

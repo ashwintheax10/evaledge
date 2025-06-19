@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html>
+<head><title>Result</title></head>
+<body>
+  <h2>{{ result }}</h2>
+  {% if score %}
+    <p>Similarity Score: {{ score }}</p>
+  {% endif %}
+  <img src="/{{ LIVE_IMAGE_PATH }}" width="300">
+</body>
+</html>

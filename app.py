@@ -1,114 +1,124 @@
-from flask import Flask, render_template, request
-import cv2
-import numpy as np
-import os
-import base64
-from PIL import Image
-from insightface.app import FaceAnalysis
-import onnxruntime as ort
+# app.py  ───────────────────────────────────────────────────
+import cv2, time, mediapipe as mp, numpy as np, winsound
+from collections import deque
+from flask import Flask, Response, render_template
+from flask_socketio import SocketIO
 
+# ─── tracker parameters ───────────────────────────────────
+BLINK_EAR_THR, BLINK_CONSEC     = 0.21, 2
+GAZE_L_THR,  GAZE_R_THR         = 1.25, 0.75
+AWAY_GRACE_SEC, EXIT_DELAY_SEC  = 1.5, 2.0
+LEFT=[33,160,158,133,153,144]; RIGHT=[362,385,387,263,373,380]
+L_IRIS=[468,469,470,471];       R_IRIS=[473,474,475,476]
+
+# ─── Flask setup ───────────────────────────────────────────
 app = Flask(__name__)
+socketio = SocketIO(app)
 
-# ---- CONFIGURATION ----
-UPLOAD_FOLDER = 'reference'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# ---- AUTO-DETECT EXECUTION PROVIDER ----
-providers = ort.get_available_providers()
-print(f"🧠 Available ONNX providers: {providers}")
-
-if 'CUDAExecutionProvider' in providers:
-    chosen_provider = ['CUDAExecutionProvider']
-    print("✅ Using GPU via CUDAExecutionProvider")
-else:
-    chosen_provider = ['CPUExecutionProvider']
-    print("⚠️ GPU not available, using CPUExecutionProvider")
-
-# ---- INITIALIZE FACE ANALYSIS ----
-face_app = FaceAnalysis(providers=chosen_provider)
-face_app.prepare(ctx_id=0, det_size=(640, 640))
-
-# ---- IMAGE UTILS ----
-def load_image(path):
-    try:
-        pil_image = Image.open(path)
-        if pil_image.mode != 'RGB':
-            pil_image = pil_image.convert('RGB')
-        return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-    except Exception as e:
-        print(f"❌ Error loading image '{path}': {e}")
-        return None
-
-def get_embedding(image):
-    faces = face_app.get(image)
-    if not faces:
-        print("❌ No face detected in the image.")
-        return None
-    embedding = faces[0].embedding
-    return embedding / np.linalg.norm(embedding)
-
-# ---- LOAD REFERENCE IMAGES ----
-reference_embeddings = {}
-print("📦 Loading reference images...")
-for filename in os.listdir(UPLOAD_FOLDER):
-    if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-        path = os.path.join(UPLOAD_FOLDER, filename)
-        print(f"➡️ Processing: {path}")
-        img = load_image(path)
-        if img is None:
-            print(f"❌ Failed to load: {filename}")
-            continue
-        emb = get_embedding(img)
-        if emb is None:
-            print(f"❌ No face found in: {filename}")
-            continue
-        reference_embeddings[filename] = emb
-        print(f"✅ Loaded and embedded: {filename}")
-print("✅ Reference images ready:", list(reference_embeddings.keys()))
-
-# ---- ROUTES ----
-@app.route('/')
+@app.route("/")
 def index():
-    return render_template('capture.html')
+    return render_template("index.html")
 
-@app.route('/verify', methods=['POST'])
-def verify():
-    try:
-        data = request.form['image']
-        encoded = data.split(',')[1]
-        nparr = np.frombuffer(base64.b64decode(encoded), np.uint8)
-        live_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+def ear(p):
+    p1,p2,p3,p4,p5,p6=p
+    return (np.linalg.norm(p2-p6)+np.linalg.norm(p3-p5))/(2*np.linalg.norm(p1-p4))
 
-        print("✅ Live image received and decoded.")
+def gaze_ratio(iris,l,r):
+    dl=np.linalg.norm(iris-l); dr=np.linalg.norm(iris-r)
+    return dr/dl if dl else 1
 
-        live_emb = get_embedding(live_image)
-        if live_emb is None:
-            cv2.imwrite("debug_no_face.jpg", live_image)  # Optional: for debugging
-            return "❌ No face detected in the captured image."
+def direction(r):
+    return "RIGHT" if r>GAZE_L_THR else "LEFT" if r<GAZE_R_THR else "CENTER"
 
-        print(f"📐 Live embedding norm: {np.linalg.norm(live_emb):.4f}")
+def gen_frames():
+    mp_face = mp.solutions.face_mesh.FaceMesh(
+        refine_landmarks=True, max_num_faces=1,
+        min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-        max_score = 0
-        matched_person = "Unknown"
-        threshold = 0.6
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-        for name, ref_emb in reference_embeddings.items():
-            score = np.dot(ref_emb, live_emb)
-            print(f"🧪 Comparing with {name} — Score: {score:.4f}")
-            if score > max_score:
-                max_score = score
-                matched_person = name
+    cam = cv2.VideoCapture(0)
+    fps_hist, blink_cntr, blinks = deque(maxlen=30), 0, 0
+    last_center, warned = time.time(), False
 
-        if max_score >= threshold:
-            return f"✅ Match found: {matched_person} (Similarity: {max_score:.4f})"
+    while cam.isOpened():
+        t0 = time.time()
+        ok, frame = cam.read();  h,w = frame.shape[:2]
+        if not ok: break
+
+        # Face detection added
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+        for (x, y, fw, fh) in faces:
+            cv2.rectangle(frame, (x, y), (x + fw, y + fh), (0, 255, 0), 2)
+
+        res = mp_face.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        gazeL=gazeR="--"; ear_disp=0
+
+        if res.multi_face_landmarks:
+            lm = res.multi_face_landmarks[0].landmark
+            eyeL = np.array([[lm[i].x*w,lm[i].y*h] for i in LEFT])
+            eyeR = np.array([[lm[i].x*w,lm[i].y*h] for i in RIGHT])
+            irisL = np.array([[lm[i].x*w,lm[i].y*h] for i in L_IRIS])
+            irisR = np.array([[lm[i].x*w,lm[i].y*h] for i in R_IRIS])
+
+            # --- EAR / blink
+            ear_disp = round((ear(eyeL)+ear(eyeR))/2, 3)
+            if ear_disp < BLINK_EAR_THR: blink_cntr += 1
+            else:
+                if blink_cntr >= BLINK_CONSEC: blinks += 1
+                blink_cntr = 0
+
+            # --- gaze direction
+            rL = gaze_ratio(irisL.mean(0), eyeL[0], eyeL[3])
+            rR = gaze_ratio(irisR.mean(0), eyeR[0], eyeR[3])
+            gazeL, gazeR = direction(rL), direction(rR)
+
+            # --- draw contours
+            for poly in (eyeL, eyeR):
+                cv2.polylines(frame,[poly.astype(int)],True,(0,255,0),1)
+            cv2.polylines(frame,[irisL.astype(int)],True,(0,255,0),1)
+            cv2.polylines(frame,[irisR.astype(int)],True,(0,255,0),1)
+            cv2.circle(frame,tuple(irisL.mean(0).astype(int)),2,(0,255,0),-1)
+            cv2.circle(frame,tuple(irisR.mean(0).astype(int)),2,(0,255,0),-1)
+
+        # ─── focus guard  (red banner + beep + socket events) ─
+        if gazeL==gazeR=="CENTER":
+            last_center=time.time(); warned=False
         else:
-            return f"❌ No match found. Closest: {matched_person} (Score: {max_score:.4f})"
+            away=time.time()-last_center
+            if away > AWAY_GRACE_SEC:
+                cv2.putText(frame, "LOOK BACK OR EXAM WILL CLOSE!",
+                            (40,60), cv2.FONT_HERSHEY_DUPLEX, 1, (0,0,255), 3)
+                if not warned:
+                    warned=True; warn_t=time.time()
+                    winsound.Beep(1000, 500)
+                    socketio.emit("warn")
 
-    except Exception as e:
-        print(f"❌ Error during verification: {str(e)}")
-        return f"❌ Error during verification: {str(e)}"
+            if warned and time.time()-warn_t > EXIT_DELAY_SEC:
+                socketio.emit("focus_lost")
+                break
 
-# ---- RUN SERVER ----
-if __name__ == '__main__':
-    print("🚀 Starting Flask server...")
-    app.run(debug=True)
+        # --- HUD overlay
+        fps_hist.append(time.time()-t0); fps = 1/np.mean(fps_hist)
+        cv2.putText(frame,f"FPS:{fps:.1f}",(10,30),cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,0),2)
+        cv2.putText(frame,f"EAR:{ear_disp:.2f}",(10,70),cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+        cv2.putText(frame,f"Blinks:{blinks}",(10,110),cv2.FONT_HERSHEY_SIMPLEX,1,(255,255,0),2)
+        cv2.putText(frame,f"R:{gazeR}",(10,180),cv2.FONT_HERSHEY_SIMPLEX,1,(255,0,255),2)
+        cv2.putText(frame,f"L:{gazeL}",(10,250),cv2.FONT_HERSHEY_SIMPLEX,1,(255,0,255),2)
+
+        # --- MJPEG encode
+        ok, jpg = cv2.imencode('.jpg', frame)
+        if not ok: continue
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+               + jpg.tobytes() + b'\r\n')
+    cam.release()
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(gen_frames(),
+        mimetype='multipart/x-mixed-replace; boundary=frame')
+
+if __name__ == "__main__":
+    socketio.run(app, host="0.0.0.0", port=5000)
